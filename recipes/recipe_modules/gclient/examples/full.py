@@ -26,6 +26,7 @@ TEST_CONFIGS = [
   'gyp',
   'infra',
   'infradata_master_manager',
+  'infradata_config',
   'internal_deps',
   'luci_gae',
   'luci_go',
@@ -40,6 +41,7 @@ TEST_CONFIGS = [
   'wasm_llvm',
   'webports',
   'with_branch_heads',
+  'with_tags',
 ]
 
 

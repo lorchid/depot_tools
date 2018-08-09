@@ -94,6 +94,13 @@ def BaseConfig(USE_MIRROR=True, CACHE_DIR=None,
         required=False,
         hidden=True),
 
+    # Check out refs/tags.
+    with_tags = Single(
+        bool,
+        empty_val=False,
+        required=False,
+        hidden=True),
+
     disable_syntax_validation = Single(bool, empty_val=False, required=False),
 
     USE_MIRROR = Static(bool(USE_MIRROR)),
@@ -352,8 +359,7 @@ def recipes_py_bare(c):
 def catapult(c):
   soln = c.solutions.add()
   soln.name = 'catapult'
-  soln.url = ('https://chromium.googlesource.com/external/github.com/'
-              'catapult-project/catapult.git')
+  soln.url = 'https://chromium.googlesource.com/catapult'
   c.got_revision_mapping['catapult'] = 'got_revision'
 
 @config_ctx(includes=['infra_internal'])
@@ -366,16 +372,26 @@ def infradata_master_manager(c):
   c.got_revision_mapping['infra-data-master-manager'] = 'got_revision'
 
 @config_ctx()
+def infradata_config(c):
+  soln = c.solutions.add()
+  soln.name = 'infra-data-config'
+  soln.url = 'https://chrome-internal.googlesource.com/infradata/config.git'
+  c.got_revision_mapping['infra-data-config'] = 'got_revision'
+
+@config_ctx()
 def with_branch_heads(c):
   c.with_branch_heads = True
+
+@config_ctx()
+def with_tags(c):
+  c.with_tags = True
 
 @config_ctx()
 def custom_tabs_client(c):
   soln = c.solutions.add()
   soln.name = 'custom_tabs_client'
   # TODO(pasko): test custom-tabs-client within a full chromium checkout.
-  soln.url = ('https://chromium.googlesource.com/external/github.com/'
-              'GoogleChrome/custom-tabs-client.git')
+  soln.url = 'https://chromium.googlesource.com/custom-tabs-client'
   c.got_revision_mapping['custom_tabs_client'] = 'got_revision'
 
 @config_ctx()

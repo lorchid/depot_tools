@@ -40,7 +40,6 @@ def RunSteps(api):
 
   patch = api.properties.get('patch', True)
   clobber = True if api.properties.get('clobber') else False
-  no_shallow = True if api.properties.get('no_shallow') else False
   with_branch_heads = api.properties.get('with_branch_heads', False)
   with_tags = api.properties.get('with_tags', False)
   refs = api.properties.get('refs', [])
@@ -50,6 +49,7 @@ def RunSteps(api):
   gerrit_no_rebase_patch_ref = bool(
       api.properties.get('gerrit_no_rebase_patch_ref'))
   manifest_name = api.properties.get('manifest_name')
+  patch_refs = api.properties.get('patch_refs')
 
   if api.properties.get('test_apply_gerrit_ref'):
     prop2arg = {
@@ -69,7 +69,6 @@ def RunSteps(api):
     )
   else:
     bot_update_step = api.bot_update.ensure_checkout(
-        no_shallow=no_shallow,
         patch=patch,
         with_branch_heads=with_branch_heads,
         with_tags=with_tags,
@@ -80,7 +79,8 @@ def RunSteps(api):
         gerrit_no_reset=gerrit_no_reset,
         gerrit_no_rebase_patch_ref=gerrit_no_rebase_patch_ref,
         disable_syntax_validation=True,
-        manifest_name=manifest_name)
+        manifest_name=manifest_name,
+        patch_refs=patch_refs)
     if patch:
       api.bot_update.deapply_patch(bot_update_step)
 
@@ -148,9 +148,6 @@ def GenTests(api):
       rietveld='https://rietveld.example.com/',
       fail_patch='download'
   ) + api.step_data('bot_update', retcode=87)
-  yield api.test('no_shallow') + api.properties(
-      no_shallow=1
-  )
   yield api.test('clobber') + api.properties(
       clobber=1
   )
@@ -193,12 +190,12 @@ def GenTests(api):
       patch_issue=338811,
       patch_set=3,
   )
-  yield api.test('apply_patch_on_gclient') + api.properties.tryserver(
+  yield api.test('no_apply_patch_on_gclient') + api.properties.tryserver(
       gerrit_project='angle/angle',
       patch_issue=338811,
       patch_set=3,
   ) + api.bot_update.properties(
-      apply_patch_on_gclient=True,
+      apply_patch_on_gclient=False,
   )
   yield api.test('tryjob_gerrit_v8') + api.properties.tryserver(
       gerrit_project='v8/v8',
@@ -222,23 +219,24 @@ def GenTests(api):
       'gerrit get_patch_destination_branch',
       api.gerrit.get_one_change_response_data(branch='experimental/feature'),
   )
-  yield api.test('tryjob_gerrit_angle_deprecated') + api.properties.tryserver(
-      patch_project='angle/angle',
-      gerrit='https://chromium-review.googlesource.com',
-      patch_storage='gerrit',
-      repository='https://chromium.googlesource.com/angle/angle',
-      rietveld=None,
-      **{
-        'event.change.id': 'angle%2Fangle~master~Ideadbeaf',
-        'event.change.number': 338811,
-        'event.change.url':
-          'https://chromium-review.googlesource.com/#/c/338811',
-        'event.patchSet.ref': 'refs/changes/11/338811/3',
-      }
+  yield api.test('tryjob_gerrit_branch_heads') + api.properties.tryserver(
+      gerrit_project='chromium/src',
+      patch_issue=338811,
+      patch_set=3,
+  ) + api.step_data(
+      'gerrit get_patch_destination_branch',
+      api.gerrit.get_one_change_response_data(branch='refs/branch-heads/67'),
   )
   yield api.test('tryjob_gerrit_webrtc') + api.properties.tryserver(
       gerrit_project='src',
       git_url='https://webrtc.googlesource.com/src',
       patch_issue=338811,
       patch_set=3,
+  )
+  yield api.test('multiple_patch_refs') + api.properties(
+      patch=True,
+      patch_refs=[
+          'https://chromium.googlesource.com/chromium/src@refs/changes/12/34/5',
+          'https://chromium.googlesource.com/v8/v8@refs/changes/124/45/6',
+      ],
   )

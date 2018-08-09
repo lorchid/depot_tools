@@ -138,7 +138,7 @@ class SCMWrapper(object):
     return log.splitlines()[0].split(' ', 1)[1]
 
   def GetCacheMirror(self):
-    if (getattr(self, 'cache_dir', None)):
+    if getattr(self, 'cache_dir', None):
       url, _ = gclient_utils.SplitUrlRevision(self.url)
       return git_cache.Mirror(url)
     return None
@@ -210,7 +210,12 @@ class GitWrapper(SCMWrapper):
   name = 'git'
   remote = 'origin'
 
-  cache_dir = None
+  @property
+  def cache_dir(self):
+    try:
+      return git_cache.Mirror.GetCachePath()
+    except RuntimeError:
+      return None
 
   def __init__(self, url=None, *args, **kwargs):
     """Removes 'git+' fake prefix from git URL."""
@@ -300,7 +305,7 @@ class GitWrapper(SCMWrapper):
 
   def _FetchAndReset(self, revision, file_list, options):
     """Equivalent to git fetch; git reset."""
-    self._UpdateBranchHeads(options, fetch=False)
+    self._SetFetchConfig(options)
 
     self._Fetch(options, prune=True, quiet=options.verbose)
     self._Scrub(revision, options)
@@ -340,29 +345,80 @@ class GitWrapper(SCMWrapper):
               self.Print('FAILED to break lock: %s: %s' % (to_break, ex))
               raise
 
+  def _GetBranchForCommit(self, commit):
+    """Get the remote branch a commit is part of."""
+    if scm.GIT.IsAncestor(self.checkout_path, commit,
+                          'refs/remotes/origin/master'):
+      return 'refs/remotes/origin/master'
+    remote_refs = self._Capture(
+        ['for-each-ref', 'refs/remotes/%s/*' % self.remote,
+         '--format=%(refname)']).splitlines()
+    for ref in remote_refs:
+      if scm.GIT.IsAncestor(self.checkout_path, commit, ref):
+        return ref
+    self.Print('Failed to find a remote ref that contains %s. '
+               'Candidate refs were %s.' % (commit, remote_refs))
+    # Fallback to the commit we got.
+    # This means that apply_path_ref will try to find the merge-base between the
+    # patch and the commit (which is most likely the commit) and cherry-pick
+    # everything in between.
+    return commit
+
   def apply_patch_ref(self, patch_repo, patch_ref, options, file_list):
+    # Abort any cherry-picks in progress.
+    try:
+      self._Capture(['cherry-pick', '--abort'])
+    except subprocess2.CalledProcessError:
+      pass
+
     base_rev = self._Capture(['rev-parse', 'HEAD'])
+    branch_rev = self._GetBranchForCommit(base_rev)
     self.Print('===Applying patch ref===')
-    self.Print('Repo is %r @ %r, ref is %r, root is %r' % (
-        patch_repo, patch_ref, base_rev, self.checkout_path))
+    self.Print('Repo is %r @ %r, ref is %r (%r), root is %r' % (
+        patch_repo, patch_ref, base_rev, branch_rev, self.checkout_path))
     self._Capture(['reset', '--hard'])
     self._Capture(['fetch', patch_repo, patch_ref])
-    if file_list is not None:
-      file_list.extend(self._GetDiffFilenames('FETCH_HEAD'))
-    self._Capture(['checkout', 'FETCH_HEAD'])
+    patch_rev = self._Capture(['rev-parse', 'FETCH_HEAD'])
 
-    if options.rebase_patch_ref:
+    try:
+      if not options.rebase_patch_ref:
+        self._Capture(['checkout', patch_rev])
+      else:
+        # Find the merge-base between the branch_rev and patch_rev to find out
+        # the changes we need to cherry-pick on top of base_rev.
+        merge_base = self._Capture(['merge-base', branch_rev, patch_rev])
+        self.Print('Merge base of %s and %s is %s' % (
+            branch_rev, patch_rev, merge_base))
+        if merge_base == patch_rev:
+          # If the merge-base is patch_rev, it means patch_rev is already part
+          # of the history, so just check it out.
+          self._Capture(['checkout', patch_rev])
+        else:
+          # If a change was uploaded on top of another change, which has already
+          # landed, one of the commits in the cherry-pick range will be
+          # redundant, since it has already landed and its changes incorporated
+          # in the tree.
+          # We pass '--keep-redundant-commits' to ignore those changes.
+          self._Capture(['cherry-pick', merge_base + '..' + patch_rev,
+                         '--keep-redundant-commits'])
+
+      if file_list is not None:
+        file_list.extend(self._GetDiffFilenames(base_rev))
+
+    except subprocess2.CalledProcessError as e:
+      self.Print('Failed to apply %r @ %r to %r at %r' % (
+              patch_repo, patch_ref, base_rev, self.checkout_path))
+      self.Print('git returned non-zero exit status %s:\n%s' % (
+          e.returncode, e.stderr))
+      # Print the current status so that developers know what changes caused the
+      # patch failure, since git cherry-pick doesn't show that information.
+      self.Print(self._Capture(['status']))
       try:
-        # TODO(ehmaldonado): Look into cherry-picking to avoid an expensive
-        # checkout + rebase.
-        self._Capture(['rebase', base_rev])
-      except subprocess2.CalledProcessError as e:
-        self._Capture(['rebase', '--abort'])
-        self.Print('Failed to apply %r @ %r to %r at %r' % (
-                patch_repo, patch_ref, base_rev, self.checkout_path))
-        self.Print('git returned non-zero exit status %s:\n%s' % (
-            e.returncode, e.stderr))
-        raise
+        self._Capture(['cherry-pick', '--abort'])
+      except subprocess2.CalledProcessError:
+        pass
+      raise
+
     if options.reset_patch_ref:
       self._Capture(['reset', '--soft', base_rev])
 
@@ -457,7 +513,7 @@ class GitWrapper(SCMWrapper):
       return self._Capture(['rev-parse', '--verify', 'HEAD'])
 
     if not managed:
-      self._UpdateBranchHeads(options, fetch=False)
+      self._SetFetchConfig(options)
       self.Print('________ unmanaged solution; skipping %s' % self.relpath)
       return self._Capture(['rev-parse', '--verify', 'HEAD'])
 
@@ -542,14 +598,15 @@ class GitWrapper(SCMWrapper):
       else:
         raise gclient_utils.Error('Invalid Upstream: %s' % upstream_branch)
 
+    self._SetFetchConfig(options)
+    self._Fetch(options, prune=options.force)
+
     if not scm.GIT.IsValidRevision(self.checkout_path, revision, sha_only=True):
       # Update the remotes first so we have all the refs.
       remote_output = scm.GIT.Capture(['remote'] + verbose + ['update'],
               cwd=self.checkout_path)
       if verbose:
         self.Print(remote_output)
-
-    self._UpdateBranchHeads(options, fetch=True)
 
     revision = self._AutoFetchRef(options, revision)
 
@@ -824,12 +881,6 @@ class GitWrapper(SCMWrapper):
 
     return sha1
 
-  def FullUrlForRelativeUrl(self, url):
-    # Strip from last '/'
-    # Equivalent to unix basename
-    base_url = self.url
-    return base_url[:base_url.rfind('/')] + url
-
   def GetGitBackupDirPath(self):
     """Returns the path where the .git folder for the current project can be
     staged/restored. Use case: subproject moved from DEPS <-> outer project."""
@@ -838,7 +889,7 @@ class GitWrapper(SCMWrapper):
 
   def _GetMirror(self, url, options):
     """Get a git_cache.Mirror object for the argument url."""
-    if not git_cache.Mirror.GetCachePath():
+    if not self.cache_dir:
       return None
     mirror_kwargs = {
         'print_func': self.filter,
@@ -942,7 +993,8 @@ class GitWrapper(SCMWrapper):
       gclient_utils.rmtree(tmp_dir)
       if template_dir:
         gclient_utils.rmtree(template_dir)
-    self._UpdateBranchHeads(options, fetch=True)
+    self._SetFetchConfig(options)
+    self._Fetch(options, prune=options.force)
     revision = self._AutoFetchRef(options, revision)
     remote_ref = scm.GIT.RefToRemoteRef(revision, self.remote)
     self._Checkout(options, ''.join(remote_ref or revision), quiet=True)
@@ -1176,6 +1228,17 @@ class GitWrapper(SCMWrapper):
   def _Fetch(self, options, remote=None, prune=False, quiet=False,
              refspec=None):
     cfg = gclient_utils.DefaultIndexPackConfig(self.url)
+    # When a mirror is configured, it fetches only the refs/heads, and possibly
+    # the refs/branch-heads and refs/tags, but not the refs/changes. So, if
+    # we're asked to fetch a refs/changes ref from the mirror, it won't have it.
+    # This makes sure that we always fetch refs/changes directly from the
+    # repository and not from the mirror.
+    if refspec and refspec.startswith('refs/changes'):
+      remote, _ = gclient_utils.SplitUrlRevision(self.url)
+      # Make sure that we fetch the (remote) refs/changes/xx ref to the (local)
+      # refs/changes/xx ref.
+      if ':' not in refspec:
+        refspec += ':' + refspec
     fetch_cmd =  cfg + [
         'fetch',
         remote or self.remote,
@@ -1194,24 +1257,30 @@ class GitWrapper(SCMWrapper):
     # Return the revision that was fetched; this will be stored in 'FETCH_HEAD'
     return self._Capture(['rev-parse', '--verify', 'FETCH_HEAD'])
 
-  def _UpdateBranchHeads(self, options, fetch=False):
+  def _SetFetchConfig(self, options):
     """Adds, and optionally fetches, "branch-heads" and "tags" refspecs
     if requested."""
-    need_fetch = fetch
+    if options.force or options.reset:
+      try:
+        self._Run(['config', '--unset-all', 'remote.%s.fetch' % self.remote],
+                  options)
+        self._Run(['config', 'remote.%s.fetch' % self.remote,
+                   '+refs/heads/*:refs/remotes/%s/*' % self.remote], options)
+      except subprocess2.CalledProcessError as e:
+        # If exit code was 5, it means we attempted to unset a config that
+        # didn't exist. Ignore it.
+        if e.returncode != 5:
+          raise
     if hasattr(options, 'with_branch_heads') and options.with_branch_heads:
       config_cmd = ['config', 'remote.%s.fetch' % self.remote,
                     '+refs/branch-heads/*:refs/remotes/branch-heads/*',
                     '^\\+refs/branch-heads/\\*:.*$']
       self._Run(config_cmd, options)
-      need_fetch = True
     if hasattr(options, 'with_tags') and options.with_tags:
       config_cmd = ['config', 'remote.%s.fetch' % self.remote,
                     '+refs/tags/*:refs/tags/*',
                     '^\\+refs/tags/\\*:.*$']
       self._Run(config_cmd, options)
-      need_fetch = True
-    if fetch and need_fetch:
-      self._Fetch(options, prune=options.force)
 
   def _AutoFetchRef(self, options, revision):
     """Attempts to fetch |revision| if not available in local repo.
@@ -1325,9 +1394,10 @@ class CipdRoot(object):
       ensure_file = None
       with tempfile.NamedTemporaryFile(
           suffix='.ensure', delete=False) as ensure_file:
+        ensure_file.write('$ParanoidMode CheckPresence\n\n')
         for subdir, packages in sorted(self._packages_by_subdir.iteritems()):
           ensure_file.write('@Subdir %s\n' % subdir)
-          for package in packages:
+          for package in sorted(packages, key=lambda p: p.name):
             ensure_file.write('%s %s\n' % (package.name, package.version))
           ensure_file.write('\n')
       yield ensure_file.name

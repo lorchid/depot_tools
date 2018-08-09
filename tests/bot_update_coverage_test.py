@@ -149,10 +149,10 @@ class BotUpdateUnittests(unittest.TestCase):
       'target_os_only': None,
       'target_cpu': None,
       'patch_root': None,
+      'patch_refs': [],
       'gerrit_repo': None,
       'gerrit_ref': None,
       'gerrit_rebase_patch_ref': None,
-      'shallow': False,
       'refs': [],
       'git_cache_dir': '',
       'cleanup_dir': None,
@@ -197,11 +197,6 @@ class BotUpdateUnittests(unittest.TestCase):
     bot_update.ensure_checkout(**self.params)
     return self.call.records
 
-  def testBasicShallow(self):
-    self.params['shallow'] = True
-    bot_update.ensure_checkout(**self.params)
-    return self.call.records
-
   def testBasicRevision(self):
     self.params['revisions'] = {
         'src': 'HEAD', 'src/v8': 'deadbeef', 'somename': 'DNE'}
@@ -232,6 +227,19 @@ class BotUpdateUnittests(unittest.TestCase):
       self.assertNotIn('git fetch ' + self.params['gerrit_repo'],
                        ' '.join(record[0]))
 
+  def testPatchRefs(self):
+    self.params['patch_refs'] = [
+        'https://chromium.googlesource.com/chromium/src@refs/changes/12/345/6',
+        'https://chromium.googlesource.com/v8/v8@refs/changes/1/234/56']
+    self.params['apply_patch_on_gclient'] = True
+    bot_update.ensure_checkout(**self.params)
+    args = self.gclient.records[0]
+    patch_refs = set(
+        args[i+1] for i in xrange(len(args))
+        if args[i] == '--patch-ref' and i+1 < len(args))
+    self.assertIn(self.params['patch_refs'][0], patch_refs)
+    self.assertIn(self.params['patch_refs'][1], patch_refs)
+
   def testBreakLocks(self):
     self.overrideSetupForWindows()
     bot_update.ensure_checkout(**self.params)
@@ -258,23 +266,27 @@ class BotUpdateUnittests(unittest.TestCase):
 
   def testGenerateManifestsBasic(self):
     gclient_output = {
-			'solutions': {
-				'breakpad/': {
-					'revision': None,
-					'scm': None,
-					'url': ('https://chromium.googlesource.com/breakpad/breakpad.git' +
-                  '@5f638d532312685548d5033618c8a36f73302d0a')
-				},
-				"src/": {
-					'revision': 'f671d3baeb64d9dba628ad582e867cf1aebc0207',
-					'scm': None,
-					'url': 'https://chromium.googlesource.com/a/chromium/src.git'
-				},
-      }
+        'solutions': {
+            'breakpad/': {
+                'revision': None,
+                'scm': None,
+                'url': ('https://chromium.googlesource.com/breakpad.git' +
+                        '@5f638d532312685548d5033618c8a36f73302d0a')
+            },
+            "src/": {
+                'revision': 'f671d3baeb64d9dba628ad582e867cf1aebc0207',
+                'scm': None,
+                'url': 'https://chromium.googlesource.com/a/chromium/src.git'
+            },
+            'src/overriden': {
+                'revision': None,
+                'scm': 'git',
+                'url': None,
+            },
+        }
     }
     out = bot_update.create_manifest(gclient_output, None, None)
     self.assertEquals(len(out['directories']), 2)
-    print out
     self.assertEquals(
         out['directories']['src']['git_checkout']['revision'],
         'f671d3baeb64d9dba628ad582e867cf1aebc0207')
@@ -286,7 +298,8 @@ class BotUpdateUnittests(unittest.TestCase):
         '5f638d532312685548d5033618c8a36f73302d0a')
     self.assertEquals(
         out['directories']['breakpad']['git_checkout']['repo_url'],
-        'https://chromium.googlesource.com/breakpad/breakpad')
+        'https://chromium.googlesource.com/breakpad')
+    self.assertNotIn('src/overridden', out['directories'])
 
 
 if __name__ == '__main__':

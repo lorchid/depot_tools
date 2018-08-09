@@ -55,6 +55,7 @@ import gerrit_util
 import git_cache
 import git_common
 import git_footers
+import metrics
 import owners
 import owners_finder
 import presubmit_support
@@ -351,10 +352,11 @@ def _buildbucket_retry(operation_name, http, *args, **kwargs):
       raise BuildbucketResponseException(msg)
 
     if response.status == 200:
-      if not content_json:
+      if content_json is None:
         raise BuildbucketResponseException(
             'Buildbucket returns invalid json content: %s.\n'
-            'Please file bugs at http://crbug.com, label "Infra-BuildBucket".' %
+            'Please file bugs at http://crbug.com, '
+            'component "Infra>Platform>BuildBucket".' %
             content)
       return content_json
     if response.status < 500 or try_count >= 2:
@@ -1519,13 +1521,14 @@ class Changelist(object):
         new_description += foot + '\n'
     self.UpdateDescription(new_description, force)
 
-  def RunHook(self, committing, may_prompt, verbose, change):
+  def RunHook(self, committing, may_prompt, verbose, change, parallel):
     """Calls sys.exit() if the hook fails; returns a HookResults otherwise."""
     try:
       return presubmit_support.DoPresubmitChecks(change, committing,
           verbose=verbose, output_stream=sys.stdout, input_stream=sys.stdin,
           default_presubmit=None, may_prompt=may_prompt,
-          gerrit_obj=self._codereview_impl.GetGerritObjForPresubmit())
+          gerrit_obj=self._codereview_impl.GetGerritObjForPresubmit(),
+          parallel=parallel)
     except presubmit_support.PresubmitFailure as e:
       DieWithError('%s\nMaybe your depot_tools is out of date?' % e)
 
@@ -1589,9 +1592,9 @@ class Changelist(object):
                                             change)
         change.SetDescriptionText(change_description.description)
       hook_results = self.RunHook(committing=False,
-                                may_prompt=not options.force,
-                                verbose=options.verbose,
-                                change=change)
+                                  may_prompt=not options.force,
+                                  verbose=options.verbose,
+                                  change=change, parallel=options.parallel)
       if not hook_results.should_continue():
         return 1
       if not options.reviewers and hook_results.reviewers:
@@ -2715,7 +2718,7 @@ class _GerritChangelistImpl(_ChangelistCodereviewBase):
       raise
     return data
 
-  def CMDLand(self, force, bypass_hooks, verbose):
+  def CMDLand(self, force, bypass_hooks, verbose, parallel):
     if git_common.is_dirty_git_tree('land'):
       return 1
     detail = self._GetChangeDetail(['CURRENT_REVISION', 'LABELS'])
@@ -2748,7 +2751,8 @@ class _GerritChangelistImpl(_ChangelistCodereviewBase):
           committing=True,
           may_prompt=not force,
           verbose=verbose,
-          change=self.GetChange(self.GetCommonAncestorWithUpstream(), None))
+          change=self.GetChange(self.GetCommonAncestorWithUpstream(), None),
+          parallel=parallel)
       if not hook_results.should_continue():
         return 1
 
@@ -3041,7 +3045,7 @@ class _GerritChangelistImpl(_ChangelistCodereviewBase):
     if options.send_mail:
       refspec_opts.append('ready')
       refspec_opts.append('notify=ALL')
-    elif not self.GetIssue():
+    elif not self.GetIssue() and options.squash:
       refspec_opts.append('wip')
     else:
       refspec_opts.append('notify=NONE')
@@ -4065,6 +4069,7 @@ class _GitCookiesChecker(object):
     return found
 
 
+@metrics.collector.collect_metrics('git cl creds-check')
 def CMDcreds_check(parser, args):
   """Checks credentials and suggests changes."""
   _, _ = parser.parse_args(args)
@@ -4087,6 +4092,7 @@ def CMDcreds_check(parser, args):
 
 
 @subcommand.usage('[repo root containing codereview.settings]')
+@metrics.collector.collect_metrics('git cl config')
 def CMDconfig(parser, args):
   """Edits configuration for this tree."""
 
@@ -4122,6 +4128,7 @@ def CMDconfig(parser, args):
   return 0
 
 
+@metrics.collector.collect_metrics('git cl baseurl')
 def CMDbaseurl(parser, args):
   """Gets or sets base-url for this branch."""
   branchref = RunGit(['symbolic-ref', 'HEAD']).strip()
@@ -4186,7 +4193,7 @@ def get_cl_statuses(changes, fine_grained, max_processes=None):
       return (cl, cl.GetStatus())
     except:
       # See http://crbug.com/629863.
-      logging.exception('failed to fetch status for %s:', cl)
+      logging.exception('failed to fetch status for cl %s:', cl.GetIssue())
       raise
 
   threads_count = len(changes)
@@ -4312,6 +4319,7 @@ def upload_branch_deps(cl, args):
   return 0
 
 
+@metrics.collector.collect_metrics('git cl archive')
 def CMDarchive(parser, args):
   """Archives and deletes branches associated with closed changelists."""
   parser.add_option(
@@ -4393,6 +4401,7 @@ def CMDarchive(parser, args):
   return 0
 
 
+@metrics.collector.collect_metrics('git cl status')
 def CMDstatus(parser, args):
   """Show status of changelists.
 
@@ -4526,6 +4535,7 @@ def write_json(path, contents):
 
 
 @subcommand.usage('[issue_number]')
+@metrics.collector.collect_metrics('git cl issue')
 def CMDissue(parser, args):
   """Sets or displays the current code review issue number.
 
@@ -4581,6 +4591,7 @@ def CMDissue(parser, args):
   return 0
 
 
+@metrics.collector.collect_metrics('git cl comments')
 def CMDcomments(parser, args):
   """Shows or posts review comments for any changelist."""
   parser.add_option('-a', '--add-comment', dest='comment',
@@ -4646,6 +4657,7 @@ def CMDcomments(parser, args):
 
 
 @subcommand.usage('[codereview url or issue id]')
+@metrics.collector.collect_metrics('git cl description')
 def CMDdescription(parser, args):
   """Brings up the editor for the current CL's description."""
   parser.add_option('-d', '--display', action='store_true',
@@ -4730,6 +4742,7 @@ def CreateDescriptionFromLog(args):
   return RunGit(['log', '--pretty=format:%s\n\n%b'] + log_args)
 
 
+@metrics.collector.collect_metrics('git cl lint')
 def CMDlint(parser, args):
   """Runs cpplint on the current changelist."""
   parser.add_option('--filter', action='append', metavar='-x,+y',
@@ -4785,6 +4798,7 @@ def CMDlint(parser, args):
   return 0
 
 
+@metrics.collector.collect_metrics('git cl presubmit')
 def CMDpresubmit(parser, args):
   """Runs presubmit tests on the current changelist."""
   parser.add_option('-u', '--upload', action='store_true',
@@ -4793,6 +4807,9 @@ def CMDpresubmit(parser, args):
                     help='Run checks even if tree is dirty')
   parser.add_option('--all', action='store_true',
                     help='Run checks against all files, not just modified ones')
+  parser.add_option('--parallel', action='store_true',
+                    help='Run all tests specified by input_api.RunTests in all '
+                         'PRESUBMIT files in parallel.')
   auth.add_auth_options(parser)
   options, args = parser.parse_args(args)
   auth_config = auth.extract_auth_config_from_options(options)
@@ -4827,7 +4844,8 @@ def CMDpresubmit(parser, args):
       committing=not options.upload,
       may_prompt=False,
       verbose=options.verbose,
-      change=change)
+      change=change,
+      parallel=options.parallel)
   return 0
 
 
@@ -4925,6 +4943,7 @@ def cleanup_list(l):
 
 
 @subcommand.usage('[flags]')
+@metrics.collector.collect_metrics('git cl upload')
 def CMDupload(parser, args):
   """Uploads the current changelist to codereview.
 
@@ -5009,6 +5028,9 @@ def CMDupload(parser, args):
                     help='Sends your change to the CQ after an approval. Only '
                          'works on repos that have the Auto-Submit label '
                          'enabled')
+  parser.add_option('--parallel', action='store_true',
+                    help='Run all tests specified by input_api.RunTests in all '
+                         'PRESUBMIT files in parallel.')
 
   # TODO: remove Rietveld flags
   parser.add_option('--private', action='store_true',
@@ -5050,6 +5072,7 @@ def CMDupload(parser, args):
 
 
 @subcommand.usage('--description=<description file>')
+@metrics.collector.collect_metrics('git cl split')
 def CMDsplit(parser, args):
   """Splits a branch into smaller branches and uploads CLs.
 
@@ -5080,6 +5103,7 @@ def CMDsplit(parser, args):
 
 
 @subcommand.usage('DEPRECATED')
+@metrics.collector.collect_metrics('git cl commit')
 def CMDdcommit(parser, args):
   """DEPRECATED: Used to commit the current changelist via git-svn."""
   message = ('git-cl no longer supports committing to SVN repositories via '
@@ -5094,6 +5118,7 @@ CHERRY_PICK_BRANCH = 'git-cl-cherry-pick'
 
 
 @subcommand.usage('[upstream branch to apply against]')
+@metrics.collector.collect_metrics('git cl land')
 def CMDland(parser, args):
   """Commits the current changelist via git.
 
@@ -5116,6 +5141,9 @@ def CMDland(parser, args):
                     help="external contributor for patch (appended to " +
                          "description and used as author for git). Should be " +
                          "formatted as 'First Last <email@example.com>'")
+  parser.add_option('--parallel', action='store_true',
+                    help='Run all tests specified by input_api.RunTests in all '
+                         'PRESUBMIT files in parallel.')
   auth.add_auth_options(parser)
   (options, args) = parser.parse_args(args)
   auth_config = auth.extract_auth_config_from_options(options)
@@ -5143,7 +5171,7 @@ def CMDland(parser, args):
                  '  If you would rather have `git cl land` upload '
                  'automatically for you, see http://crbug.com/642759')
   return cl._codereview_impl.CMDLand(options.force, options.bypass_hooks,
-                                     options.verbose)
+                                     options.verbose, options.parallel)
 
 
 def PushToGitWithAutoRebase(remote, branch, original_description,
@@ -5220,6 +5248,7 @@ def IsFatalPushFailure(push_stdout):
 
 
 @subcommand.usage('<patch url or issue id or issue url>')
+@metrics.collector.collect_metrics('git cl patch')
 def CMDpatch(parser, args):
   """Patches in a code review."""
   parser.add_option('-b', dest='newbranch',
@@ -5350,6 +5379,7 @@ def GetTreeStatusReason():
   return status['message']
 
 
+@metrics.collector.collect_metrics('git cl tree')
 def CMDtree(parser, args):
   """Shows the status of the tree."""
   _, args = parser.parse_args(args)
@@ -5366,6 +5396,7 @@ def CMDtree(parser, args):
   return 0
 
 
+@metrics.collector.collect_metrics('git cl try')
 def CMDtry(parser, args):
   """Triggers try jobs using either BuildBucket or CQ dry run."""
   group = optparse.OptionGroup(parser, 'Try job options')
@@ -5479,6 +5510,7 @@ def CMDtry(parser, args):
   return 0
 
 
+@metrics.collector.collect_metrics('git cl try-results')
 def CMDtry_results(parser, args):
   """Prints info about try jobs associated with current CL."""
   group = optparse.OptionGroup(parser, 'Try job results options')
@@ -5541,6 +5573,7 @@ def CMDtry_results(parser, args):
 
 
 @subcommand.usage('[new upstream branch]')
+@metrics.collector.collect_metrics('git cl upstream')
 def CMDupstream(parser, args):
   """Prints or sets the name of the upstream branch, if any."""
   _, args = parser.parse_args(args)
@@ -5562,6 +5595,7 @@ def CMDupstream(parser, args):
   return 0
 
 
+@metrics.collector.collect_metrics('git cl web')
 def CMDweb(parser, args):
   """Opens the current CL in the web browser."""
   _, args = parser.parse_args(args)
@@ -5577,6 +5611,7 @@ def CMDweb(parser, args):
   return 0
 
 
+@metrics.collector.collect_metrics('git cl set-commit')
 def CMDset_commit(parser, args):
   """Sets the commit bit to trigger the Commit Queue."""
   parser.add_option('-d', '--dry-run', action='store_true',
@@ -5607,6 +5642,7 @@ def CMDset_commit(parser, args):
   return 0
 
 
+@metrics.collector.collect_metrics('git cl set-close')
 def CMDset_close(parser, args):
   """Closes the issue."""
   _add_codereview_issue_select_options(parser)
@@ -5625,6 +5661,7 @@ def CMDset_close(parser, args):
   return 0
 
 
+@metrics.collector.collect_metrics('git cl diff')
 def CMDdiff(parser, args):
   """Shows differences between local tree and last upload."""
   parser.add_option(
@@ -5663,8 +5700,13 @@ def CMDdiff(parser, args):
   return 0
 
 
+@metrics.collector.collect_metrics('git cl owners')
 def CMDowners(parser, args):
   """Finds potential owners for reviewing."""
+  parser.add_option(
+      '--ignore-current',
+      action='store_true',
+      help='Ignore the CL\'s current reviewers and start from scratch.')
   parser.add_option(
       '--no-color',
       action='store_true',
@@ -5701,7 +5743,7 @@ def CMDowners(parser, args):
       affected_files,
       change.RepositoryRoot(),
       author,
-      cl.GetReviewers(),
+      [] if options.ignore_current else cl.GetReviewers(),
       fopen=file, os_path=os.path,
       disable_color=options.no_color,
       override_files=change.OriginalOwnersFiles()).run()
@@ -5730,6 +5772,7 @@ def MatchingFileType(file_name, extensions):
 
 
 @subcommand.usage('[files or directories to diff]')
+@metrics.collector.collect_metrics('git cl format')
 def CMDformat(parser, args):
   """Runs auto-formatting tools (clang-format etc.) on the diff."""
   CLANG_EXTS = ['.cc', '.cpp', '.h', '.m', '.mm', '.proto', '.java']
@@ -5780,7 +5823,7 @@ def CMDformat(parser, args):
   diff_files = [x for x in diff_files if os.path.isfile(x)]
 
   if opts.js:
-    CLANG_EXTS.append('.js')
+    CLANG_EXTS.extend(['.js', '.ts'])
 
   clang_diff_files = [x for x in diff_files if MatchingFileType(x, CLANG_EXTS)]
   python_diff_files = [x for x in diff_files if MatchingFileType(x, ['.py'])]
@@ -5839,12 +5882,15 @@ def CMDformat(parser, args):
 
     if opts.full:
       if python_diff_files:
-        cmd = [yapf_tool]
-        if not opts.dry_run and not opts.diff:
-          cmd.append('-i')
-        stdout = RunCommand(cmd + python_diff_files, cwd=top_dir)
-        if opts.diff:
-          sys.stdout.write(stdout)
+        if opts.dry_run or opts.diff:
+          cmd = [yapf_tool, '--diff'] + python_diff_files
+          stdout = RunCommand(cmd, error_ok=True, cwd=top_dir)
+          if opts.diff:
+            sys.stdout.write(stdout)
+          elif len(stdout) > 0:
+            return_value = 2
+        else:
+          RunCommand([yapf_tool, '-i'] + python_diff_files, cwd=top_dir)
     else:
       # TODO(sbc): yapf --lines mode still has some issues.
       # https://github.com/google/yapf/issues/154
@@ -5919,6 +5965,7 @@ def GetDirtyMetricsDirs(diff_files):
 
 
 @subcommand.usage('<codereview url or issue id>')
+@metrics.collector.collect_metrics('git cl checkout')
 def CMDcheckout(parser, args):
   """Checks out a branch associated with a given Rietveld or Gerrit issue."""
   _, args = parser.parse_args(args)
@@ -5982,8 +6029,20 @@ class OptionParser(optparse.OptionParser):
         '-v', '--verbose', action='count', default=0,
         help='Use 2 times for more debugging info')
 
-  def parse_args(self, args=None, values=None):
-    options, args = optparse.OptionParser.parse_args(self, args, values)
+  def parse_args(self, args=None, _values=None):
+    # Create an optparse.Values object that will store only the actual passed
+    # options, without the defaults.
+    actual_options = optparse.Values()
+    _, args = optparse.OptionParser.parse_args(self, args, actual_options)
+    # Create an optparse.Values object with the default options.
+    options = optparse.Values(self.get_default_values().__dict__)
+    # Update it with the options passed by the user.
+    options._update_careful(actual_options.__dict__)
+    # Store the options passed by the user in an _actual_options attribute.
+    # We store only the keys, and not the values, since the values can contain
+    # arbitrary information, which might be PII.
+    metrics.collector.add('arguments', actual_options.__dict__.keys())
+
     levels = [logging.WARNING, logging.INFO, logging.DEBUG]
     logging.basicConfig(
         level=levels[min(options.verbose, len(levels) - 1)],
@@ -6002,6 +6061,8 @@ def main(argv):
   global settings
   settings = Settings()
 
+  if not metrics.DISABLE_METRICS_COLLECTION:
+    metrics.collector.add('project_urls', [settings.GetViewVCUrl().strip('/+')])
   colorize_CMDstatus_doc()
   dispatcher = subcommand.CommandDispatcher(__name__)
   try:
@@ -6022,8 +6083,5 @@ if __name__ == '__main__':
   # unit testing.
   fix_encoding.fix_encoding()
   setup_color.init()
-  try:
+  with metrics.collector.print_notice_and_exit():
     sys.exit(main(sys.argv[1:]))
-  except KeyboardInterrupt:
-    sys.stderr.write('interrupted\n')
-    sys.exit(1)
