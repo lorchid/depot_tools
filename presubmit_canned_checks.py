@@ -892,8 +892,8 @@ def CheckOwners(input_api, output_api, source_file_filter=None):
         output_fn('Missing %s for these files:\n    %s' %
                   (needed, '\n    '.join(sorted(missing_files))))]
     if input_api.tbr and affects_owners:
-      output_list.append(output_fn('Note that TBR does not apply to changes '
-                                   'that affect OWNERS files.'))
+      output_list.append(output_fn('The CL affects an OWNERS file, so TBR will '
+                                   'be ignored.'))
     if not input_api.is_committing:
       suggested_owners = owners_db.reviewers_for(missing_files, owner_email)
       owners_with_comments = []
@@ -1060,18 +1060,26 @@ def PanProjectChecks(input_api, output_api,
   return results
 
 
-def CheckPatchFormatted(
-    input_api, output_api, check_js=False, check_python=False,
-    result_factory=None):
+def CheckPatchFormatted(input_api,
+                        output_api,
+                        check_js=False,
+                        check_python=None,
+                        result_factory=None):
   result_factory = result_factory or output_api.PresubmitPromptWarning
   import git_cl
 
   display_args = []
   if check_js:
     display_args.append('--js')
-  if check_python:
-    # --python requires --full
-    display_args.extend(['--python', '--full'])
+
+  # Explicitly setting check_python to will enable/disable python formatting
+  # on all files. Leaving it as None will enable checking patch formatting
+  # on files that have a .style.yapf file in a parent directory.
+  if check_python is not None:
+    if check_python:
+      display_args.append('--python')
+    else:
+      display_args.append('--no-python')
 
   cmd = ['-C', input_api.change.RepositoryRoot(),
          'cl', 'format', '--dry-run', '--presubmit'] + display_args
@@ -1179,6 +1187,29 @@ def CheckCIPDPackages(input_api, output_api, platforms, packages):
   for k, v in packages.iteritems():
     manifest.append('%s %s' % (k, v))
   return CheckCIPDManifest(input_api, output_api, content='\n'.join(manifest))
+
+
+def CheckCIPDClientDigests(input_api, output_api, client_version_file):
+  """Verifies that *.digests file was correctly regenerated.
+
+  <client_version_file>.digests file contains pinned hashes of the CIPD client.
+  It is consulted during CIPD client bootstrap and self-update. It should be
+  regenerated each time CIPD client version file changes.
+
+  Args:
+    client_version_file (str): Path to a text file with CIPD client version.
+  """
+  cmd = [
+    'cipd' if not input_api.is_windows else 'cipd.bat',
+    'selfupdate-roll', '-check', '-version-file', client_version_file,
+  ]
+  if input_api.verbose:
+    cmd += ['-log-level', 'debug']
+  return input_api.Command(
+      'Check CIPD client_version_file.digests file',
+      cmd,
+      {'shell': True} if input_api.is_windows else {},  # to resolve cipd.bat
+      output_api.PresubmitError)
 
 
 def CheckVPythonSpec(input_api, output_api, file_filter=None):

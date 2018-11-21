@@ -21,31 +21,36 @@ class WindowsSDKApi(recipe_api.RecipeApi):
     self._sdk_properties = sdk_properties
 
   @contextmanager
-  def __call__(self, path=None, version=None, enabled=True):
+  def __call__(self, path=None, version=None, enabled=True, target_arch='x64'):
     """Setups the SDK environment when enabled.
 
     Args:
       path (path): Path to a directory where to install the SDK
-        (default is '[start_dir]/windows_sdk')
+        (default is '[CACHE]/windows_sdk')
       version (str): CIPD version of the SDK
         (default is set via $infra/windows_sdk.version property)
       enabled (bool): Whether the SDK should be used or not.
+      target_arch (str): 'x86' or 'x64'.
 
     Raises:
         StepFailure or InfraFailure.
     """
     if enabled:
       sdk_dir = self._ensure_sdk(
-          path or self.m.path['start_dir'].join('windows_sdk'),
+          path or self.m.path['cache'].join('windows_sdk'),
           version or self._sdk_properties['version'])
       try:
-        with self.m.context(**self._sdk_env(sdk_dir)):
+        with self.m.context(**self._sdk_env(sdk_dir, target_arch)):
           yield
       finally:
         # cl.exe automatically starts background mspdbsrv.exe daemon which
         # needs to be manually stopped so Swarming can tidy up after itself.
+        #
+        # Since mspdbsrv may not actually be running, don't fail if we can't
+        # actually kill it.
         self.m.step('taskkill mspdbsrv',
-                    ['taskkill.exe', '/f', '/t', '/im', 'mspdbsrv.exe'])
+                    ['taskkill.exe', '/f', '/t', '/im', 'mspdbsrv.exe'],
+                    ok_ret='any')
     else:
       yield
 
@@ -64,13 +69,14 @@ class WindowsSDKApi(recipe_api.RecipeApi):
       self.m.cipd.ensure(sdk_dir, pkgs)
       return sdk_dir
 
-  def _sdk_env(self, sdk_dir):
+  def _sdk_env(self, sdk_dir, target_arch):
     """Constructs the environment for the SDK.
 
     Returns environment and environment prefixes.
 
     Args:
       sdk_dir (path): Path to a directory containing the SDK.
+      target_arch (str): 'x86' or 'x64'
     """
     env = {}
     env_prefixes = {}
@@ -85,7 +91,8 @@ class WindowsSDKApi(recipe_api.RecipeApi):
     # }
     # All these environment variables need to be added to the environment
     # for the compiler and linker to work.
-    filename = 'SetEnv.%s.json' % {32: 'x86', 64: 'x64'}[self.m.platform.bits]
+    assert target_arch in ('x86', 'x64')
+    filename = 'SetEnv.%s.json' % target_arch
     step_result = self.m.json.read(
         'read %s' % filename, sdk_dir.join('win_sdk', 'bin', filename),
         step_test_data=lambda: self.m.json.test_api.output({
